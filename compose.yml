@@ -1,0 +1,15 @@
+services:
+  test-listener:
+    build: .
+    command: ./tcp-comm listener 0.0.0.0:8080  # Make sure listener binds to all interfaces
+  
+  test-sender:
+    depends_on:
+      - test-listener
+    build: .
+    command: ./tcp-comm peer test-listener:8080  # Connect to `test-listener` service by name
+  test-node:
+    depends_on:
+      - test-listener
+    build: .
+    command: ./tcp-comm node test-listener:8080
