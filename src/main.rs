@@ -1,9 +1,22 @@
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use std::error::Error;
 use tokio::spawn;
 use tokio::time::{self, Duration};
+use clap::Parser;
+use std::sync::Arc;
+use std::collections::HashMap;
+
+#[derive(Parser, Debug)]
+struct Cli {
+    // The role which the node takes (listener, sender)
+    #[clap(short, long)]
+    role: String,
+    // Addresses of peers (supports multiple addresses for sender mode)
+    #[arg(short, long, required = true)]
+    address: Vec<String>,
+}
 
 async fn handle_peer(socket: TcpStream, mut rx: mpsc::Receiver<String>) -> io::Result<()> {
     // Use `split()` to get mutable references for reading and writing
@@ -68,33 +81,7 @@ async fn send_msg_every_five_sec(tx: mpsc::Sender<String>) {
 // Function for connecting a peer and handle communication
 async fn connect_to_peer(addr: &str, tx: mpsc::Sender<String>) -> io::Result<TcpStream> {
     let socket = TcpStream::connect(addr).await?;
-
-    // Use tokio::spawn_blocking to handle stdin input, since stdin may block in async context.
-    /*tokio::task::spawn_blocking(move || {
-        let mut input = String::new();
-        let stdin = std::io::stdin();
-
-        loop {
-            input.clear();
-
-            // Blocking read from stdin
-            if stdin.read_line(&mut input).is_err() {
-                eprintln!("Error reading from stdin.");
-                break;
-            }
-
-            let trimmed_input = input.trim().to_string()+",";
-
-            // Log the input
-            eprintln!("Read input: {:?}", trimmed_input);
-
-            // Send the message to the async task via the mpsc channel
-            if tx.blocking_send(trimmed_input).is_err() {
-                eprintln!("Failed to send message. Receiver may have been dropped.");
-                break;
-            }
-        }
-    });*/
+    println!("Connected to: {}", addr);
 
     spawn(send_msg_every_five_sec(tx));
 
@@ -113,30 +100,70 @@ async fn start_listener(addr: &str) -> io::Result<()> {
         // If mpsc channel is full, sender waits for a space
         let (tx, rx) = mpsc::channel(32);
 
-        tokio::spawn(async move {
+        //TODO: create a channel with a small buffer for each connection. Use hash map to store the corresponding tx channel.
+
+        spawn(async move {
             if let Err(e) = handle_peer(socket, rx).await {
                 eprintln!("Error handling peer: {}", e);
             }
         });
 
+        spawn(send_msg_every_five_sec(tx));
+
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "listener".to_string());
-    //TODO: Can we get addresses as list from CLI??
-    let addr = std::env::args().nth(2).unwrap_or_else(|| "127.0.0.1:8080".to_string());
+async fn main() {
+    // Parse CLI arguments
+    let args = Cli::parse();
 
-    if mode == "listener" {
-        start_listener(&addr).await?;
-    } else {
-        // Connect to a peer and start bi-directional communication
-        //TODO: connect to multiple nodes
-        let (tx, rx) = mpsc::channel(32);
-        let socket = connect_to_peer(&addr, tx).await?;
-        handle_peer(socket, rx).await?;
+    if args.address.is_empty() {
+        eprintln!("Please provide at least one address as argument");
     }
 
-    Ok(())
+    if args.role == "listener" {
+        if args.address.len() > 1 {
+            eprintln!("Error: Multiple addresses for listener are given!!");
+        }
+        if start_listener(&args.address[0]).await.is_err(){
+            eprintln!("Failed: start listener");
+        }
+    } else {
+        println!("Start sender");
+        // Use Arc<Mutex<HashMap>> for shared and concurrent access
+        let addr_channels = Arc::new(Mutex::new(HashMap::new()));
+
+        for addr in &args.address {
+            let addr_clone = addr.clone();
+            let addr_channels_clone = Arc::clone(&addr_channels);
+
+            // Create a new channel for each address
+            let (tx, mut rx) = mpsc::channel(32);
+
+            // Insert the sender into the hashmap inside a mutex
+            {
+                let mut addr_channels = addr_channels_clone.lock().await;
+                addr_channels.insert(addr_clone.clone(), tx);
+            }
+            // Lock the hashmap and retrieve the sender for this address
+            let addr_channels = addr_channels_clone.lock().await;
+            if let Some(tx) = addr_channels.get(&addr_clone) {
+                let socket = connect_to_peer(&addr_clone, tx.clone()).await.unwrap(); //TODO: Implement Error Handling and make sure that other healthy connections continues to run.
+                spawn(async move{
+                    if handle_peer(socket, rx).await.is_err(){
+                        eprintln!("handle_peer failed");
+                    }
+                });
+            } else {
+                eprintln!("No sender found for {}", addr_clone);
+            }
+        }
+    }
+
+    //TODO: Make sure that this main function does not close without this loop!
+    loop {
+
+    }
+
 }
